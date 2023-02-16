@@ -1,4 +1,4 @@
-module github.com/tehbilly/go-module-analyzer
+module github.com/tehbilly/go-module-cost
 
 go 1.17
 
