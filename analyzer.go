@@ -1,32 +1,32 @@
-package modanalyzer
+package modulecost
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/dave/jennifer/jen"
 	"golang.org/x/mod/modfile"
 )
 
-// TODO: Allow for multiple modules instead of just one. We could base it on GOOS/GOARCH, establish a baseline once,
-//       then calculate the cost for each module or specific modules on-demand.
-
 type Result struct {
 	// How long it took to perform analysis
 	Duration time.Duration
 
+	// If an error was encountered, this will not be nil
+	Error error
+
 	// Analysis information
 	Module  string
 	Version string
+	GOOS    string
+	GOARCH  string
 
 	// Sizes in bytes
 	Baseline uint64
@@ -35,111 +35,197 @@ type Result struct {
 }
 
 type Analyzer struct {
-	goos   string
-	goarch string
-	module string
+	workDir string
+	modules []string
+	goos    []string
+	goarch  []string
 }
 
 type Option func(a *Analyzer)
 
+func WithWorkDir(workDir string) Option {
+	return func(a *Analyzer) {
+		if workDir != "" {
+			a.workDir = workDir
+		}
+	}
+}
+
+func WithModule(module string) Option {
+	return func(a *Analyzer) {
+		if module != "" {
+			a.modules = append(a.modules, module)
+		}
+	}
+}
+
+func WithModules(modules []string) Option {
+	return func(a *Analyzer) {
+		for _, module := range modules {
+			if module != "" {
+				a.modules = append(a.modules, module)
+			}
+		}
+	}
+}
+
 func WithGOOS(goos string) Option {
 	return func(a *Analyzer) {
-		a.goos = goos
+		if goos != "" {
+			a.goos = append(a.goos, goos)
+		}
+	}
+}
+
+func WithGOOSes(gooses []string) Option {
+	return func(a *Analyzer) {
+		for _, goos := range gooses {
+			if goos != "" {
+				a.goos = append(a.goos, goos)
+			}
+		}
 	}
 }
 
 func WithGOARCH(goarch string) Option {
 	return func(a *Analyzer) {
-		a.goarch = goarch
+		if goarch != "" {
+			a.goarch = append(a.goarch, goarch)
+		}
 	}
 }
 
-func NewAnalyzer(module string, options ...Option) (*Analyzer, error) {
-	if module == "" {
-		return nil, errors.New("must specify module name")
+func WithGOARCHes(goarches []string) Option {
+	return func(a *Analyzer) {
+		for _, goarch := range goarches {
+			if goarch != "" {
+				a.goarch = append(a.goarch, goarch)
+			}
+		}
+	}
+}
+
+func validate(a *Analyzer) error {
+	if len(a.modules) == 0 {
+		return errors.New("must provide at least one module to analyze")
 	}
 
-	a := &Analyzer{
-		module: module,
+	if a.workDir == "" {
+		a.workDir = filepath.Join(os.TempDir(), "go-module-cost")
 	}
+
+	if len(a.goos) == 0 {
+		a.goos = append(a.goos, runtime.GOOS)
+	}
+
+	if len(a.goarch) == 0 {
+		a.goarch = append(a.goarch, runtime.GOARCH)
+	}
+
+	return nil
+}
+
+func NewAnalyzer(options ...Option) (*Analyzer, error) {
+	a := &Analyzer{}
 
 	for _, option := range options {
 		option(a)
 	}
 
-	// TODO: Make these work
-	if a.goos == "" {
-		a.goos = runtime.GOOS
-	}
-
-	// TODO: Make these work
-	if a.goarch == "" {
-		a.goarch = runtime.GOARCH
+	if err := validate(a); err != nil {
+		return nil, err
 	}
 
 	return a, nil
 }
 
-func (a *Analyzer) CostInBytes() (*Result, error) {
+func (a *Analyzer) Analyze() ([]*Result, error) {
+	baseSizes := map[string]uint64{}
+	// Calculate base sizes
+	for _, goos := range a.goos {
+		for _, goarch := range a.goarch {
+			baseSize, err := a.calcBytes(filepath.Join(a.workDir, "base"), "", goos, goarch)
+			if err != nil {
+				return nil, err
+			}
+			baseSizes[fmt.Sprintf("%s:%s", goos, goarch)] = baseSize
+		}
+	}
+
+	var results []*Result
+
+	for _, goos := range a.goos {
+		for _, goarch := range a.goarch {
+			for _, module := range a.modules {
+				result, err := a.analyzeModule(module, goos, goarch)
+				if err != nil {
+					// TODO: Add logging
+					results = append(results, result)
+					continue
+				}
+				baseSize := baseSizes[fmt.Sprintf("%s:%s", goos, goarch)]
+				result.Baseline = baseSize
+				result.Cost = result.WithMod - baseSize
+				results = append(results, result)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+func (a *Analyzer) analyzeModule(module string, goos string, goarch string) (*Result, error) {
 	start := time.Now()
 
-	workDir := filepath.Join(os.TempDir(), "go-module-Analyzer", path.Base(a.module))
+	workDir := filepath.Join(a.workDir, path.Base(module))
 	defer func() {
 		if err := os.RemoveAll(workDir); err != nil {
 			fmt.Printf("Unable to remove '%s': %s\n", workDir, err)
 		}
 	}()
 
-	var wg sync.WaitGroup
-
-	var err error
-	var baseSize uint64
-	var modSize uint64
-
-	// Baseline binary size
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		baseSize, err = a.calcBytes(filepath.Join(workDir, "base"), "")
-	}()
-
-	// Size of binary with module
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		modSize, err = a.calcBytes(filepath.Join(workDir, "mod"), a.module)
-	}()
-
-	wg.Wait()
+	modSize, err := a.calcBytes(filepath.Join(workDir, "mod"), module, goos, goarch)
 
 	// See if any error occurred calculating bytes
 	if err != nil {
-		return nil, err
+		return &Result{
+			Duration: time.Since(start),
+			Module:   module,
+			GOOS:     goos,
+			GOARCH:   goarch,
+			Error:    err,
+		}, err
 	}
 
-	modPath, modVersion, err := versionFromModFile(filepath.Join(workDir, "mod", "go.mod"), a.module)
+	modPath, modVersion, err := versionFromModFile(filepath.Join(workDir, "mod", "go.mod"), module)
 	if err != nil {
-		return nil, err
+		return &Result{
+			Duration: time.Since(start),
+			Module:   module,
+			GOOS:     goos,
+			GOARCH:   goarch,
+			Error:    err,
+		}, err
 	}
 
 	return &Result{
 		Duration: time.Since(start),
 		Module:   modPath,
 		Version:  modVersion,
-		Baseline: baseSize,
+		GOOS:     goos,
+		GOARCH:   goarch,
 		WithMod:  modSize,
-		Cost:     modSize - baseSize,
 	}, nil
 }
 
-func (a *Analyzer) calcBytes(workDir string, module string) (uint64, error) {
+func (a *Analyzer) calcBytes(workDir string, module string, goos string, goarch string) (uint64, error) {
 	// Build the directory
 	if err := buildModuleDir(workDir, module); err != nil {
 		return 0, err
 	}
 
 	// Build the binary
-	if err := a.buildBin(workDir); err != nil {
+	if err := a.buildBin(workDir, goos, goarch); err != nil {
 		return 0, err
 	}
 
@@ -147,13 +233,13 @@ func (a *Analyzer) calcBytes(workDir string, module string) (uint64, error) {
 	return binBytes(workDir)
 }
 
-func (a *Analyzer) buildBin(workDir string) error {
+func (a *Analyzer) buildBin(workDir string, goos string, goarch string) error {
 	gg := exec.Command("go", "get", "./...")
 	gg.Dir = workDir
 	gg.Env = append(os.Environ(),
 		"CGO_ENABLED=0",
-		fmt.Sprintf("GOOS=%s", a.goos),
-		fmt.Sprintf("GOARCH=%s", a.goarch),
+		fmt.Sprintf("GOOS=%s", goos),
+		fmt.Sprintf("GOARCH=%s", goarch),
 	)
 	if err := gg.Run(); err != nil {
 		return err
@@ -163,8 +249,8 @@ func (a *Analyzer) buildBin(workDir string) error {
 	bc.Dir = workDir
 	bc.Env = append(os.Environ(),
 		"CGO_ENABLED=0",
-		fmt.Sprintf("GOOS=%s", a.goos),
-		fmt.Sprintf("GOARCH=%s", a.goarch),
+		fmt.Sprintf("GOOS=%s", goos),
+		fmt.Sprintf("GOARCH=%s", goarch),
 	)
 	if err := bc.Run(); err != nil {
 		return err
@@ -189,12 +275,12 @@ func buildModuleDir(workDir string, module string) error {
 	}
 
 	// write go.mod
-	if err := ioutil.WriteFile(filepath.Join(workDir, "go.mod"), mod, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(workDir, "go.mod"), mod, 0644); err != nil {
 		return err
 	}
 
 	// write main.go
-	if err := ioutil.WriteFile(filepath.Join(workDir, "main.go"), main, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(workDir, "main.go"), main, 0644); err != nil {
 		return err
 	}
 
@@ -204,7 +290,7 @@ func buildModuleDir(workDir string, module string) error {
 func modFile(module string) ([]byte, error) {
 	mf := &modfile.File{}
 
-	moduleName := "github.com/tehbilly/go-module-Analyzer"
+	moduleName := "github.com/tehbilly/go-module-analyzer"
 	if module != "" {
 		moduleName = moduleName + "/" + path.Base(module)
 	}
@@ -237,7 +323,7 @@ func mainFile(module string) ([]byte, error) {
 }
 
 func versionFromModFile(modFile string, module string) (string, string, error) {
-	fb, err := ioutil.ReadFile(modFile)
+	fb, err := os.ReadFile(modFile)
 	if err != nil {
 		return module, "", err
 	}

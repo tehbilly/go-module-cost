@@ -1,54 +1,59 @@
-package modanalyzer
+package modulecost_test
 
 import (
 	"fmt"
+	"os"
+	"testing"
+
 	"github.com/dustin/go-humanize"
 	"github.com/olekukonko/tablewriter"
-	"os"
-	"sync"
-	"testing"
+	modulecost "github.com/tehbilly/go-module-cost"
 )
 
-func TestNewAnalyzer(t *testing.T) {
+func TestAnalyzer(t *testing.T) {
 	tw := tablewriter.NewWriter(os.Stdout)
-	tw.SetHeader([]string{"package", "version", "cost"})
+	tw.SetHeader([]string{"package", "version", "goos", "goarch", "duration", "cost"})
 
 	type testCase struct {
 		module  string
-		options []Option
+		options []modulecost.Option
 	}
 
 	testCases := []testCase{
-		{module: "github.com/fsouza/go-dockerclient", options: []Option{}},
-		{module: "github.com/docker/docker/client", options: []Option{}},
+		{options: []modulecost.Option{
+			modulecost.WithModule("github.com/fsouza/go-dockerclient"),
+			modulecost.WithModule("github.com/docker/docker/client"),
+			modulecost.WithGOOS("windows"),
+			modulecost.WithGOOS("darwin"),
+			modulecost.WithGOOS("linux"),
+		}},
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(len(testCases))
 
 	for _, tc := range testCases {
-		go func(t *testing.T, tc testCase) {
-			defer wg.Done()
+		a, err := modulecost.NewAnalyzer(tc.options...)
+		if err != nil {
+			t.Error(err)
+			t.Fail()
+			return
+		}
 
-			a, err := NewAnalyzer(tc.module, tc.options...)
-			if err != nil {
-				t.Error(err)
-				t.Fail()
-				return
+		if r, err := a.Analyze(); err != nil {
+			fmt.Printf("Error running a.CostInBytes(): %s\n", err)
+			t.Fail()
+			return
+		} else {
+			for _, result := range r {
+				tw.Append([]string{
+					result.Module,
+					result.Version,
+					result.GOOS,
+					result.GOARCH,
+					fmt.Sprint(result.Duration),
+					humanize.Bytes(result.Cost),
+				})
 			}
-
-			if r, err := a.CostInBytes(); err != nil {
-				fmt.Printf("Error running a.CostInBytes(): %s\n", err)
-				t.Fail()
-				return
-			} else {
-				//fmt.Printf("Cost in bytes for %s@%s: %s (took: %s)\n", r.Module, r.Version, humanize.Bytes(r.Cost), r.Duration)
-				tw.Append([]string{r.Module, r.Version, humanize.Bytes(r.Cost)})
-			}
-		}(t, tc)
+		}
 	}
-
-	wg.Wait()
 
 	tw.Render()
 }
