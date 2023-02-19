@@ -15,25 +15,37 @@ import (
 	"golang.org/x/mod/modfile"
 )
 
+// Result represents the results of analyzing a Module / GOOS / GOARCH combination
 type Result struct {
-	// How long it took to perform analysis
+	// Duration records how long it took to perform analysis for this Module / GOOS / GOARCH
 	Duration time.Duration
 
-	// If an error was encountered, this will not be nil
+	// Error will be nil unless an error was encountered performing this analysis
 	Error error
 
-	// Analysis information
-	Module  string
-	Version string
-	GOOS    string
-	GOARCH  string
+	// Module is the module path
+	Module string
 
-	// Sizes in bytes
+	// Version is the module version as parsed from the generate go.mod file
+	Version string
+
+	// GOOS is the GOOS environment variable used for this analysis
+	GOOS string
+
+	// GOARCH is the GOARCH environment variable used for this analysis
+	GOARCH string
+
+	// Baseline is the size in bytes of the baseline (without any modules added) binary
 	Baseline uint64
-	WithMod  uint64
-	Cost     uint64
+
+	// WithMod is the size in bytes of the binary built that includes this module
+	WithMod uint64
+
+	// Cost is the result of subtracting Baseline from WithMod
+	Cost uint64
 }
 
+// Analyzer instances can be used to analyze cost of a matrix of modules under specified GOOS and GOARCH
 type Analyzer struct {
 	workDir string
 	modules []string
@@ -41,67 +53,103 @@ type Analyzer struct {
 	goarch  []string
 }
 
-type Option func(a *Analyzer)
+// Option is used to configure an Analyzer instance
+type Option func(a *Analyzer) error
 
+// WithWorkDir will specify a path to use while performing analysis
 func WithWorkDir(workDir string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		if workDir != "" {
 			a.workDir = workDir
 		}
+		return nil
 	}
 }
 
+// WithModule will add module to list of modules to analyze
 func WithModule(module string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		if module != "" {
 			a.modules = append(a.modules, module)
 		}
+		return nil
 	}
 }
 
+// WithModules will add modules to list of modules to analyze
 func WithModules(modules []string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		for _, module := range modules {
 			if module != "" {
 				a.modules = append(a.modules, module)
 			}
 		}
+		return nil
 	}
 }
 
+// WithModulesFromGoMod will read a list of modules that are required from go.mod at goModPath
+func WithModulesFromGoMod(goModPath string) Option {
+	return func(a *Analyzer) error {
+		goModBytes, err := os.ReadFile(goModPath)
+		if err != nil {
+			return fmt.Errorf("unable to read go.mod: %w", err)
+		}
+
+		parsed, err := modfile.Parse("go.mod", goModBytes, nil)
+		if err != nil {
+			return fmt.Errorf("unable to parse go.mod: %w", err)
+		}
+
+		for _, req := range parsed.Require {
+			a.modules = append(a.modules, req.Mod.String())
+		}
+
+		return nil
+	}
+}
+
+// WithGOOS will add the specified GOOS to analysis
 func WithGOOS(goos string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		if goos != "" {
 			a.goos = append(a.goos, goos)
 		}
+		return nil
 	}
 }
 
+// WithGOOSes will add all specified GOOSes to analysis
 func WithGOOSes(gooses []string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		for _, goos := range gooses {
 			if goos != "" {
 				a.goos = append(a.goos, goos)
 			}
 		}
+		return nil
 	}
 }
 
+// WithGOARCH will add the specified GOARCH to analysis
 func WithGOARCH(goarch string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		if goarch != "" {
 			a.goarch = append(a.goarch, goarch)
 		}
+		return nil
 	}
 }
 
+// WithGOARCHes will add all specified GOARCHes to analysis
 func WithGOARCHes(goarches []string) Option {
-	return func(a *Analyzer) {
+	return func(a *Analyzer) error {
 		for _, goarch := range goarches {
 			if goarch != "" {
 				a.goarch = append(a.goarch, goarch)
 			}
 		}
+		return nil
 	}
 }
 
@@ -125,11 +173,14 @@ func validate(a *Analyzer) error {
 	return nil
 }
 
+// NewAnalyzer will create an instance of Analyzer configured using provided options
 func NewAnalyzer(options ...Option) (*Analyzer, error) {
 	a := &Analyzer{}
 
 	for _, option := range options {
-		option(a)
+		if err := option(a); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := validate(a); err != nil {
@@ -139,6 +190,9 @@ func NewAnalyzer(options ...Option) (*Analyzer, error) {
 	return a, nil
 }
 
+// Analyze will perform analysis. An error will be returned if a base size is unable to be calculated for a particular
+// GOOS and GOARCH pair, otherwise any errors during analysis of a particular module/GOOS/GOARCH will be added to the
+// relevant Result
 func (a *Analyzer) Analyze() ([]*Result, error) {
 	baseSizes := map[string]uint64{}
 	// Calculate base sizes
